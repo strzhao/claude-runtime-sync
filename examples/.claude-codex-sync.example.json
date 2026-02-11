@@ -1,0 +1,15 @@
+{
+  "ignoreSkills": ["example-skill-to-ignore"],
+  "skillNameMap": {
+    "source-skill-name": "target-skill-name"
+  },
+  "ignorePlugins": ["example-plugin-to-ignore"],
+  "pluginNameMap": {
+    "task-notifier": "task-notifier"
+  },
+  "ignoreHookSources": ["home"],
+  "ignoreMcpServers": ["Example MCP To Ignore"],
+  "mcpNameMap": {
+    "Chrome DevTools MCP": "chrome-devtools-mcp"
+  }
+}
