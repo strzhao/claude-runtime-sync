@@ -1,6 +1,6 @@
 {
   "name": "claude-runtime-sync",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Use Claude config as the single source of truth and sync reusable capabilities into Codex runtime.",
   "license": "MIT",
   "type": "commonjs",
