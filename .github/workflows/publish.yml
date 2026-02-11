@@ -20,8 +20,13 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: 24
           registry-url: "https://registry.npmjs.org"
+
+      - name: Show runtime versions
+        run: |
+          node -v
+          npm -v
 
       - name: Verify tag matches package.json version
         if: startsWith(github.ref, 'refs/tags/v')
