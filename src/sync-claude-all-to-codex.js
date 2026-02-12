@@ -718,22 +718,67 @@ function mirrorProjectMcpIntoHome({ claudeHome, projectRoot, check }) {
   };
 }
 
+function normalizeMcpOptions(options) {
+  const safeOptions = options && typeof options === 'object' && !Array.isArray(options)
+    ? options
+    : {};
+
+  return {
+    ignoreMcpServers: Array.isArray(safeOptions.ignoreMcpServers) ? safeOptions.ignoreMcpServers : [],
+    mcpNameMap: safeOptions.mcpNameMap && typeof safeOptions.mcpNameMap === 'object' && !Array.isArray(safeOptions.mcpNameMap)
+      ? safeOptions.mcpNameMap
+      : {}
+  };
+}
+
 function syncMergedMcp({
   codexHome,
   check,
   home,
-  project
+  project,
+  extraSources = []
 }) {
   const warnings = [];
   const mergedServers = {};
   const sourceTrace = {};
   const sourceFiles = [];
 
+  const normalizedExtraSources = Array.isArray(extraSources) ? extraSources : [];
+  for (const source of normalizedExtraSources) {
+    if (!source || typeof source !== 'object') {
+      continue;
+    }
+
+    const sourceLabel = typeof source.sourceLabel === 'string' && source.sourceLabel.trim()
+      ? source.sourceLabel.trim()
+      : 'extra';
+    const sourcePath = typeof source.filePath === 'string' ? source.filePath : null;
+    if (!sourcePath) {
+      continue;
+    }
+
+    const sourceDisplay = `${sourceLabel}:${sourcePath}`;
+    const safeOptions = normalizeMcpOptions(source.options);
+
+    if (collectServersFromFile({
+      filePath: sourcePath,
+      sourceLabel,
+      options: safeOptions,
+      mergedServers,
+      warnings,
+      sourceTrace
+    })) {
+      sourceFiles.push(sourceDisplay);
+    } else {
+      sourceFiles.push(sourceDisplay);
+    }
+  }
+
   if (home && home.enabled) {
     if (collectServersFromFile({
       filePath: home.mcpPath,
       sourceLabel: 'home',
-      options: home.options,
+      options: normalizeMcpOptions(home.options),
       mergedServers,
       warnings,
       sourceTrace
@@ -750,7 +795,7 @@ function syncMergedMcp({
     if (collectServersFromFile({
       filePath: project.mcpPath,
       sourceLabel: 'project',
-      options: project.options,
+      options: normalizeMcpOptions(project.options),
       mergedServers,
       warnings,
       sourceTrace
@@ -811,7 +856,7 @@ function syncMergedMcp({
   };
 }
 
-function syncSources({ projectRoot, claudeHome, codexHome, check, includeHome, includeProject }) {
+function syncSources({ projectRoot, claudeHome, codexHome, check, includeHome, includeProject, extraMcpSources = [] }) {
   const homeOptions = loadSyncOptions(path.join(claudeHome, '.codex-sync.json'));
   const projectOptions = projectRoot
     ? loadSyncOptions(path.join(projectRoot, '.claude-codex-sync.json'))
@@ -875,7 +920,8 @@ function syncSources({ projectRoot, claudeHome, codexHome, check, includeHome, i
       enabled: includeProject && Boolean(projectRoot) && !projectMcpMirror.enabled,
       mcpPath: projectRoot ? path.join(projectRoot, '.mcp.json') : null,
       options: projectOptions
-    }
+    },
+    extraSources: extraMcpSources
   });
 
   warnings.push(...mcp.warnings);

@@ -32,7 +32,7 @@ codex
 - 同步 skills（`~/.claude/skills` + `<repo>/.claude/skills`）
 - 同步 MCP 到 `~/.codex/config.toml` 托管区块
 - 镜像项目 `.mcp.json` 到 `~/.claude/mcp.json`（保持 `.claude` 为真源）
-- 同步 Claude plugins / hooks 元信息到 Codex 运行目录
+- 同步已启用 Claude plugins（目录 + hooks + plugin 内 skills + plugin 内 .mcp.json）
 - 把 `CLAUDE.md` 复用到 `agents.md` / `gemini.md`（软链接优先）
 - 通过 bridge 将 Codex 事件映射到 Claude 风格 hooks
 

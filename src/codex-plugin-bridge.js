@@ -13,11 +13,18 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 
 const BRIDGE_MANIFEST_RELATIVE_PATH = path.join('plugins', 'claude-bridge', 'manifest.json');
+const DEFAULT_DEBUG_LOG_RELATIVE_PATH = path.join('log', 'plugin-bridge.log');
+const WATCH_LOCK_RELATIVE_PATH = path.join('plugins', 'claude-bridge', 'watch.lock');
+const RECENT_EVENT_TTL_MS = 30_000;
+const RECENT_EVENT_MAX = 2000;
+const WATCH_CLEANUP_LOG_TAIL_BYTES = 32 * 1024 * 1024;
+const WATCH_CLEANUP_ACTIVITY_WINDOW_MS = 6 * 60 * 60 * 1000;
 
 const CODEX_EVENT_MAP = {
   exec_approval_request: ['PermissionRequest'],
   apply_patch_approval_request: ['PermissionRequest'],
   request_user_input: ['PermissionRequest'],
+  agent_message: ['Stop'],
   task_started: ['TaskStarted'],
   session_configured: ['TaskStarted'],
   task_complete: ['TaskComplete'],
@@ -36,7 +43,9 @@ function parseArgs(argv) {
     watch: false,
     pollMs: 600,
     emitStop: false,
-    quiet: true
+    quiet: true,
+    debugLog: true,
+    debugLogPath: null
   };
 
   for (const arg of argv) {
@@ -52,6 +61,22 @@ function parseArgs(argv) {
 
     if (arg === '--verbose') {
       options.quiet = false;
+      continue;
+    }
+
+    if (arg === '--debug-log') {
+      options.debugLog = true;
+      continue;
+    }
+
+    if (arg === '--no-debug-log') {
+      options.debugLog = false;
+      continue;
+    }
+
+    if (arg.startsWith('--debug-log=')) {
+      options.debugLog = true;
+      options.debugLogPath = path.resolve(arg.slice('--debug-log='.length));
       continue;
     }
 
@@ -251,27 +276,338 @@ function safeStringValue(value) {
   return JSON.stringify(value);
 }
 
-function runHookCommand({ command, timeoutSec, contextEnv, quiet }) {
-  const result = spawnSync('bash', ['-lc', command], {
-    env: {
-      ...process.env,
-      ...contextEnv
-    },
-    stdio: quiet ? 'ignore' : 'inherit',
-    timeout: Math.max(1, timeoutSec) * 1000
+function resolveDebugLogPath(options, codexHome) {
+  if (!options.debugLog) {
+    return null;
+  }
+
+  if (options.debugLogPath) {
+    return options.debugLogPath;
+  }
+
+  if (process.env.CODEX_PLUGIN_BRIDGE_DEBUG_LOG_PATH && process.env.CODEX_PLUGIN_BRIDGE_DEBUG_LOG_PATH.trim()) {
+    return path.resolve(process.env.CODEX_PLUGIN_BRIDGE_DEBUG_LOG_PATH);
+  }
+
+  return path.join(codexHome, DEFAULT_DEBUG_LOG_RELATIVE_PATH);
+}
+
+function createDebugLogger(logFilePath) {
+  if (!logFilePath) {
+    return () => {};
+  }
+
+  return (kind, data = {}) => {
+    try {
+      fs.mkdirSync(path.dirname(logFilePath), { recursive: true });
+      const payload = {
+        ts: new Date().toISOString(),
+        pid: process.pid,
+        kind,
+        ...data
+      };
+
+      fs.appendFileSync(logFilePath, `${JSON.stringify(payload)}\n`, 'utf8');
+    } catch (_) {
+      // Ignore logging failures to avoid impacting bridge behavior.
+    }
+  };
+}
+
+function readTailText(filePath, maxBytes) {
+  if (!fs.existsSync(filePath)) {
+    return '';
+  }
+
+  const stat = fs.statSync(filePath);
+  if (stat.size <= 0) {
+    return '';
+  }
+
+  const readBytes = Math.max(0, Math.min(maxBytes, stat.size));
+  if (readBytes <= 0) {
+    return '';
+  }
+
+  const fd = fs.openSync(filePath, 'r');
+  try {
+    const buffer = Buffer.alloc(readBytes);
+    fs.readSync(fd, buffer, 0, readBytes, stat.size - readBytes);
+    return buffer.toString('utf8');
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function parseLogTimestampMs(rawValue) {
+  if (typeof rawValue !== 'string' || !rawValue.trim()) {
+    return null;
+  }
+
+  const ts = Date.parse(rawValue);
+  return Number.isFinite(ts) ? ts : null;
+}
+
+function cleanupCompetingWatchers(codexHome, projectRoot, logDebug, debugLogPath) {
+  if (!debugLogPath) {
+    return;
+  }
+
+  const tailText = readTailText(debugLogPath, WATCH_CLEANUP_LOG_TAIL_BYTES);
+  if (!tailText.trim()) {
+    logDebug('watch-cleanup-scan', {
+      status: 'empty-log',
+      codexHome,
+      projectRoot: projectRoot || ''
+    });
+    return;
+  }
+
+  const lines = tailText.split('\n');
+  const pidState = new Map();
+  let parsedLineCount = 0;
+
+  for (const line of lines) {
+    if (!line.trim()) {
+      continue;
+    }
+
+    let record;
+    try {
+      record = JSON.parse(line);
+    } catch (_) {
+      continue;
+    }
+    parsedLineCount += 1;
+
+    const pid = Number(record.pid);
+    if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) {
+      continue;
+    }
+
+    const tsMs = parseLogTimestampMs(record.ts) || 0;
+    let state = pidState.get(pid);
+    if (!state) {
+      state = {
+        lastTsMs: 0,
+        isWatch: false,
+        isStopped: false,
+        codexHome: '',
+        projectRoot: ''
+      };
+      pidState.set(pid, state);
+    }
+
+    if (tsMs > state.lastTsMs) {
+      state.lastTsMs = tsMs;
+    }
+
+    if (record.kind === 'bridge-start' && record.mode === 'watch') {
+      state.isWatch = true;
+      state.isStopped = false;
+      state.codexHome = typeof record.codexHome === 'string' ? record.codexHome : '';
+      state.projectRoot = typeof record.projectRoot === 'string' ? record.projectRoot : '';
+      continue;
+    }
+
+    if (record.kind === 'bridge-stop' && record.mode === 'watch') {
+      state.isStopped = true;
+      continue;
+    }
+  }
+
+  const nowMs = Date.now();
+  let candidateCount = 0;
+  let killedCount = 0;
+  for (const [pid, state] of pidState.entries()) {
+    if (!state.isWatch || state.isStopped) {
+      continue;
+    }
+
+    if (state.codexHome !== codexHome || state.projectRoot !== (projectRoot || '')) {
+      continue;
+    }
+
+    if ((nowMs - state.lastTsMs) > WATCH_CLEANUP_ACTIVITY_WINDOW_MS) {
+      continue;
+    }
+    candidateCount += 1;
+
+    try {
+      process.kill(pid, 'SIGTERM');
+      killedCount += 1;
+      logDebug('watch-cleanup-terminated', {
+        targetPid: pid,
+        targetProjectRoot: state.projectRoot,
+        targetCodexHome: state.codexHome
+      });
+    } catch (error) {
+      logDebug('watch-cleanup-skip', {
+        targetPid: pid,
+        error: error && error.message ? error.message : String(error || '')
+      });
+    }
+  }
+
+  logDebug('watch-cleanup-scan', {
+    status: 'completed',
+    codexHome,
+    projectRoot: projectRoot || '',
+    parsedLineCount,
+    trackedPidCount: pidState.size,
+    candidateCount,
+    killedCount
+  });
+}
+
+function isProcessAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return false;
+  }
+
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function parseWatchLockPid(rawText) {
+  if (!rawText || !rawText.trim()) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(rawText);
+    return Number.isInteger(parsed.pid) ? parsed.pid : null;
+  } catch (_) {
+    const numeric = Number(rawText.trim());
+    return Number.isInteger(numeric) ? numeric : null;
+  }
+}
+
+function acquireWatchLock(codexHome, logDebug) {
+  const lockPath = path.join(codexHome, WATCH_LOCK_RELATIVE_PATH);
+  const payload = JSON.stringify({
+    pid: process.pid,
+    createdAt: new Date().toISOString()
   });
 
-  return result.status === 0;
+  const writeLock = () => {
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+    const fd = fs.openSync(lockPath, 'wx');
+    fs.writeFileSync(fd, payload, 'utf8');
+    fs.closeSync(fd);
+  };
+
+  try {
+    writeLock();
+  } catch (error) {
+    if (!error || error.code !== 'EEXIST') {
+      throw error;
+    }
+
+    let existingPid = null;
+    let stale = true;
+    try {
+      const existingRaw = fs.readFileSync(lockPath, 'utf8');
+      existingPid = parseWatchLockPid(existingRaw);
+      stale = !isProcessAlive(existingPid);
+    } catch (_) {
+      stale = true;
+    }
+
+    if (!stale) {
+      logDebug('watch-lock-busy', { lockPath, existingPid });
+      return null;
+    }
+
+    try {
+      fs.unlinkSync(lockPath);
+      writeLock();
+      logDebug('watch-lock-recovered', { lockPath, existingPid });
+    } catch (_) {
+      logDebug('watch-lock-busy', { lockPath, existingPid });
+      return null;
+    }
+  }
+
+  logDebug('watch-lock-acquired', { lockPath });
+
+  let released = false;
+  return () => {
+    if (released) {
+      return;
+    }
+    released = true;
+
+    try {
+      const existingRaw = fs.readFileSync(lockPath, 'utf8');
+      const existingPid = parseWatchLockPid(existingRaw);
+      if (existingPid === process.pid) {
+        fs.unlinkSync(lockPath);
+      }
+    } catch (_) {
+      // Ignore lock cleanup errors.
+    }
+
+    logDebug('watch-lock-released', { lockPath });
+  };
+}
+
+function runHookCommand({ command, timeoutSec, contextEnv, quiet }) {
+  const startedAt = Date.now();
+  let result;
+
+  try {
+    result = spawnSync('bash', ['-lc', command], {
+      env: {
+        ...process.env,
+        ...contextEnv
+      },
+      stdio: quiet ? 'ignore' : 'inherit',
+      timeout: Math.max(1, timeoutSec) * 1000
+    });
+  } catch (error) {
+    return {
+      ok: false,
+      status: null,
+      signal: '',
+      error: error.message,
+      timedOut: false,
+      durationMs: Date.now() - startedAt
+    };
+  }
+
+  return {
+    ok: result.status === 0,
+    status: Number.isInteger(result.status) ? result.status : null,
+    signal: typeof result.signal === 'string' ? result.signal : '',
+    error: result.error ? result.error.message : '',
+    timedOut: Boolean(result.error && result.error.code === 'ETIMEDOUT'),
+    durationMs: Date.now() - startedAt
+  };
 }
 
 function getAllHookSources(manifest) {
   return [...manifest.plugins, ...manifest.topHooks];
 }
 
-function executeEvent(manifest, eventRecord, projectRoot, quiet) {
+function executeEvent(manifest, eventRecord, projectRoot, quiet, logDebug) {
   const names = mapEventNames(eventRecord.rawType);
   const matcherText = buildMatcherText(eventRecord);
   const sources = getAllHookSources(manifest);
+  const hasSpecialMapping = Array.isArray(CODEX_EVENT_MAP[eventRecord.rawType]) && CODEX_EVENT_MAP[eventRecord.rawType].length > 0;
+  let executedCommandCount = 0;
+
+  if (hasSpecialMapping || eventRecord.rawType === 'Stop') {
+    logDebug('event-received', {
+      rawType: eventRecord.rawType,
+      mappedTypes: names,
+      matcherText
+    });
+  }
 
   for (const source of sources) {
     const events = Array.isArray(source.events) ? source.events : [];
@@ -296,7 +632,18 @@ function executeEvent(manifest, eventRecord, projectRoot, quiet) {
         }
 
         const timeout = Number.isFinite(commandDef.timeout) ? Number(commandDef.timeout) : 10;
-        runHookCommand({
+        executedCommandCount += 1;
+
+        logDebug('hook-command-start', {
+          sourceId: source.id || '',
+          sourceName: source.name || '',
+          eventName: eventDef.eventName,
+          matcher: eventDef.matcher || '',
+          timeoutSec: timeout,
+          command: commandDef.command
+        });
+
+        const hookResult = runHookCommand({
           command: commandDef.command,
           timeoutSec: timeout,
           quiet,
@@ -310,12 +657,64 @@ function executeEvent(manifest, eventRecord, projectRoot, quiet) {
             CRS_CALL_ID: safeStringValue(eventRecord.payload.call_id)
           }
         });
+
+        logDebug('hook-command-finish', {
+          sourceId: source.id || '',
+          sourceName: source.name || '',
+          eventName: eventDef.eventName,
+          command: commandDef.command,
+          ok: hookResult.ok,
+          status: hookResult.status,
+          signal: hookResult.signal,
+          timedOut: hookResult.timedOut,
+          durationMs: hookResult.durationMs,
+          error: hookResult.error
+        });
       }
     }
   }
+
+  if ((hasSpecialMapping || eventRecord.rawType === 'Stop') && executedCommandCount === 0) {
+    logDebug('event-no-hook-executed', {
+      rawType: eventRecord.rawType,
+      mappedTypes: names,
+      matcherText
+    });
+  }
 }
 
-function processSessionFile(filePath, state, manifest, projectRoot, quiet) {
+function primeSessionOffsets(files, state) {
+  for (const filePath of files) {
+    if (state.offsets.has(filePath)) {
+      continue;
+    }
+
+    const stat = fs.statSync(filePath);
+    state.offsets.set(filePath, stat.size);
+    state.remainders.set(filePath, '');
+  }
+}
+
+function recordAndCheckDuplicateEvent(state, signature) {
+  const nowMs = Date.now();
+  const recentEvents = state.recentEvents;
+  const lastSeenMs = recentEvents.get(signature);
+  recentEvents.set(signature, nowMs);
+
+  if (recentEvents.size > RECENT_EVENT_MAX) {
+    for (const [key, seenAt] of recentEvents.entries()) {
+      if ((nowMs - seenAt) > RECENT_EVENT_TTL_MS || recentEvents.size > RECENT_EVENT_MAX) {
+        recentEvents.delete(key);
+      } else {
+        break;
+      }
+    }
+  }
+
+  return typeof lastSeenMs === 'number' && (nowMs - lastSeenMs) <= RECENT_EVENT_TTL_MS;
+}
+
+function processSessionFile(filePath, state, manifest, projectRoot, quiet, logDebug) {
   let currentOffset = state.offsets.get(filePath) || 0;
   let remainder = state.remainders.get(filePath) || '';
 
@@ -349,7 +748,15 @@ function processSessionFile(filePath, state, manifest, projectRoot, quiet) {
       continue;
     }
 
-    executeEvent(manifest, eventRecord, projectRoot, quiet);
+    if (recordAndCheckDuplicateEvent(state, line)) {
+      logDebug('event-deduped', {
+        rawType: eventRecord.rawType,
+        sourceFile: filePath
+      });
+      continue;
+    }
+
+    executeEvent(manifest, eventRecord, projectRoot, quiet, logDebug);
   }
 
   state.offsets.set(filePath, stat.size);
@@ -358,22 +765,38 @@ function processSessionFile(filePath, state, manifest, projectRoot, quiet) {
 
 function runOnce(options) {
   const codexHome = resolveCodexHome(options.codexHome);
+  const logDebug = createDebugLogger(resolveDebugLogPath(options, codexHome));
   const manifest = readManifest(codexHome);
   const sessionsRoot = path.join(codexHome, 'sessions');
   const files = collectSessionFiles(sessionsRoot, options.since);
 
+  logDebug('bridge-start', {
+    mode: 'once',
+    codexHome,
+    projectRoot: options.projectRoot || '',
+    since: options.since,
+    watch: false,
+    manifestPath: manifest.manifestPath,
+    pluginCount: manifest.plugins.length,
+    topHookCount: manifest.topHooks.length,
+    sessionFileCount: files.length
+  });
+
   const state = {
     offsets: new Map(),
-    remainders: new Map()
+    remainders: new Map(),
+    recentEvents: new Map()
   };
 
   for (const filePath of files) {
-    processSessionFile(filePath, state, manifest, options.projectRoot, options.quiet);
+    processSessionFile(filePath, state, manifest, options.projectRoot, options.quiet, logDebug);
   }
 
   if (options.emitStop) {
-    executeEvent(manifest, { rawType: 'Stop', payload: {} }, options.projectRoot, options.quiet);
+    executeEvent(manifest, { rawType: 'Stop', payload: {} }, options.projectRoot, options.quiet, logDebug);
   }
+
+  logDebug('bridge-stop', { mode: 'once' });
 }
 
 function sleep(ms) {
@@ -382,13 +805,35 @@ function sleep(ms) {
 
 async function watch(options) {
   const codexHome = resolveCodexHome(options.codexHome);
+  const debugLogPath = resolveDebugLogPath(options, codexHome);
+  const logDebug = createDebugLogger(debugLogPath);
   const manifest = readManifest(codexHome);
   const sessionsRoot = path.join(codexHome, 'sessions');
 
+  logDebug('bridge-start', {
+    mode: 'watch',
+    codexHome,
+    projectRoot: options.projectRoot || '',
+    since: options.since,
+    watch: true,
+    pollMs: options.pollMs,
+    manifestPath: manifest.manifestPath,
+    pluginCount: manifest.plugins.length,
+    topHookCount: manifest.topHooks.length
+  });
+
   const state = {
     offsets: new Map(),
-    remainders: new Map()
+    remainders: new Map(),
+    recentEvents: new Map()
   };
+
+  cleanupCompetingWatchers(codexHome, options.projectRoot, logDebug, debugLogPath);
+
+  const releaseWatchLock = acquireWatchLock(codexHome, logDebug);
+  if (!releaseWatchLock) {
+    return;
+  }
 
   let stopping = false;
   const requestStop = () => {
@@ -398,17 +843,28 @@ async function watch(options) {
   process.on('SIGINT', requestStop);
   process.on('SIGTERM', requestStop);
 
-  while (!stopping) {
-    const files = collectSessionFiles(sessionsRoot, options.since);
-    for (const filePath of files) {
-      if (stopping) {
-        break;
-      }
-      processSessionFile(filePath, state, manifest, options.projectRoot, options.quiet);
-    }
+  const initialFiles = collectSessionFiles(sessionsRoot, options.since);
+  primeSessionOffsets(initialFiles, state);
+  logDebug('watch-initialized', { trackedFileCount: initialFiles.length });
 
-    await sleep(options.pollMs);
+  try {
+    while (!stopping) {
+      const files = collectSessionFiles(sessionsRoot, options.since);
+      primeSessionOffsets(files, state);
+      for (const filePath of files) {
+        if (stopping) {
+          break;
+        }
+        processSessionFile(filePath, state, manifest, options.projectRoot, options.quiet, logDebug);
+      }
+
+      await sleep(options.pollMs);
+    }
+  } finally {
+    releaseWatchLock();
   }
+
+  logDebug('bridge-stop', { mode: 'watch' });
 }
 
 async function main() {

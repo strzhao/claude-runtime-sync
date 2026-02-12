@@ -1,6 +1,6 @@
 {
   "name": "claude-runtime-sync",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Use Claude config as the single source of truth and sync reusable capabilities into Codex runtime.",
   "license": "MIT",
   "type": "commonjs",
@@ -38,7 +38,8 @@
   "scripts": {
     "check": "node -c bin/crs.js && node -c src/claude-runtime-sync.js && node -c src/sync-claude-all-to-codex.js && node -c src/codex-plugin-bridge.js && node -c src/install-codex-zsh-hook.js",
     "smoke": "node bin/crs.js --help",
-    "pack:dry-run": "npm pack --dry-run"
+    "pack:dry-run": "npm pack --dry-run",
+    "test": "node --test"
   },
   "publishConfig": {
     "access": "public"
