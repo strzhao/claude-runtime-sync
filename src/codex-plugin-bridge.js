@@ -197,6 +197,23 @@ function collectSessionFiles(sessionsRoot, sinceEpochSec) {
   return files.sort((a, b) => a.localeCompare(b));
 }
 
+function parseEventTimestampSec(parsed) {
+  if (!parsed || typeof parsed !== 'object') {
+    return null;
+  }
+
+  if (typeof parsed.timestamp !== 'string' || !parsed.timestamp.trim()) {
+    return null;
+  }
+
+  const ms = Date.parse(parsed.timestamp);
+  if (!Number.isFinite(ms)) {
+    return null;
+  }
+
+  return Math.floor(ms / 1000);
+}
+
 function parseCodexEvent(line) {
   let parsed;
   try {
@@ -209,19 +226,59 @@ function parseCodexEvent(line) {
     return null;
   }
 
-  if (parsed.type !== 'event_msg') {
-    return null;
+  if (parsed.type === 'event_msg') {
+    const payload = parsed.payload;
+    if (!payload || typeof payload !== 'object' || typeof payload.type !== 'string') {
+      return null;
+    }
+
+    return {
+      rawType: payload.type,
+      payload,
+      eventTimestampSec: parseEventTimestampSec(parsed)
+    };
   }
 
-  const payload = parsed.payload;
-  if (!payload || typeof payload !== 'object' || typeof payload.type !== 'string') {
-    return null;
+  if (parsed.type === 'response_item') {
+    const payload = parsed.payload;
+    if (!payload || typeof payload !== 'object' || payload.type !== 'function_call') {
+      return null;
+    }
+
+    const toolName = typeof payload.name === 'string' ? payload.name : '';
+    if (!toolName) {
+      return null;
+    }
+
+    let toolArgs;
+    try {
+      toolArgs = JSON.parse(payload.arguments || '{}');
+    } catch (_) {
+      return null;
+    }
+
+    if (!toolArgs || typeof toolArgs !== 'object') {
+      return null;
+    }
+
+    // PermissionRequest is represented as a function_call that asks for escalation.
+    if (toolArgs.sandbox_permissions !== 'require_escalated') {
+      return null;
+    }
+
+    const rawType = toolName === 'apply_patch' ? 'apply_patch_approval_request' : 'exec_approval_request';
+    return {
+      rawType,
+      payload: {
+        ...toolArgs,
+        tool_name: toolName,
+        call_id: typeof payload.call_id === 'string' ? payload.call_id : ''
+      },
+      eventTimestampSec: parseEventTimestampSec(parsed)
+    };
   }
 
-  return {
-    rawType: payload.type,
-    payload
-  };
+  return null;
 }
 
 function mapEventNames(rawType) {
@@ -233,12 +290,22 @@ function buildMatcherText(eventRecord) {
   const payload = eventRecord.payload || {};
 
   const parts = [eventRecord.rawType];
+  if (typeof payload.tool_name === 'string') {
+    parts.push(payload.tool_name);
+  }
+
   if (Array.isArray(payload.command)) {
     parts.push(payload.command.join(' '));
+  } else if (typeof payload.command === 'string') {
+    parts.push(payload.command);
   }
 
   if (typeof payload.reason === 'string') {
     parts.push(payload.reason);
+  }
+
+  if (typeof payload.justification === 'string') {
+    parts.push(payload.justification);
   }
 
   if (typeof payload.call_id === 'string') {
@@ -689,8 +756,9 @@ function primeSessionOffsets(files, state) {
       continue;
     }
 
-    const stat = fs.statSync(filePath);
-    state.offsets.set(filePath, stat.size);
+    // Start from file beginning and rely on timestamp-based since filtering.
+    // This avoids missing newly appended events in long-lived session files.
+    state.offsets.set(filePath, 0);
     state.remainders.set(filePath, '');
   }
 }
@@ -748,6 +816,15 @@ function processSessionFile(filePath, state, manifest, projectRoot, quiet, logDe
       continue;
     }
 
+    if (
+      Number.isFinite(state.sinceEpochSec) &&
+      Number(state.sinceEpochSec) > 0 &&
+      Number.isFinite(eventRecord.eventTimestampSec) &&
+      Number(eventRecord.eventTimestampSec) < Number(state.sinceEpochSec)
+    ) {
+      continue;
+    }
+
     if (recordAndCheckDuplicateEvent(state, line)) {
       logDebug('event-deduped', {
         rawType: eventRecord.rawType,
@@ -785,7 +862,8 @@ function runOnce(options) {
   const state = {
     offsets: new Map(),
     remainders: new Map(),
-    recentEvents: new Map()
+    recentEvents: new Map(),
+    sinceEpochSec: options.since
   };
 
   for (const filePath of files) {
@@ -825,7 +903,8 @@ async function watch(options) {
   const state = {
     offsets: new Map(),
     remainders: new Map(),
-    recentEvents: new Map()
+    recentEvents: new Map(),
+    sinceEpochSec: options.since
   };
 
   cleanupCompetingWatchers(codexHome, options.projectRoot, logDebug, debugLogPath);
@@ -848,14 +927,16 @@ async function watch(options) {
   logDebug('watch-initialized', { trackedFileCount: initialFiles.length });
 
   try {
-    while (!stopping) {
+    // Always perform one final scan after stop is requested to avoid losing tail events.
+    while (true) {
       const files = collectSessionFiles(sessionsRoot, options.since);
       primeSessionOffsets(files, state);
       for (const filePath of files) {
-        if (stopping) {
-          break;
-        }
         processSessionFile(filePath, state, manifest, options.projectRoot, options.quiet, logDebug);
+      }
+
+      if (stopping) {
+        break;
       }
 
       await sleep(options.pollMs);
