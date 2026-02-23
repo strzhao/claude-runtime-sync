@@ -5,8 +5,8 @@
   "license": "MIT",
   "type": "commonjs",
   "bin": {
-    "crs": "./bin/crs.js",
-    "claude-runtime-sync": "./bin/crs.js"
+    "crs": "bin/crs.js",
+    "claude-runtime-sync": "bin/crs.js"
   },
   "files": [
     "bin",
@@ -29,7 +29,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/strzhao/claude-runtime-sync.git"
+    "url": "git+https://github.com/strzhao/claude-runtime-sync.git"
   },
   "homepage": "https://github.com/strzhao/claude-runtime-sync",
   "bugs": {
