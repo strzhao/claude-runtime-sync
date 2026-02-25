@@ -539,19 +539,77 @@ function parseMcpEntryMapFromBlock(blockText) {
   return map;
 }
 
+function stripDuplicateMcpEntries(configText, managedServerNames) {
+  if (managedServerNames.length === 0) {
+    return configText;
+  }
+
+  const managedBlock = extractManagedBlock(configText);
+  const managedStart = managedBlock ? managedBlock.start : configText.length;
+  const managedEnd = managedBlock ? managedBlock.end : configText.length;
+
+  const before = configText.slice(0, managedStart);
+  const after = configText.slice(managedEnd);
+
+  // Build a set of table headers to strip (including sub-tables like .env)
+  const nameSet = new Set(managedServerNames);
+
+  function stripFromSection(text) {
+    const lines = text.split('\n');
+    const result = [];
+    let skipping = false;
+
+    for (const line of lines) {
+      // Check if this line is a TOML table header like [mcp_servers.X] or [mcp_servers.X.env]
+      const tableMatch = line.match(/^\[mcp_servers\.([A-Za-z0-9_-]+)(?:\.[^\]]+)?\]\s*$/);
+      if (tableMatch) {
+        const serverName = tableMatch[1];
+        if (nameSet.has(serverName)) {
+          skipping = true;
+          continue;
+        }
+        skipping = false;
+      } else if (/^\[/.test(line.trim()) && !/^\[mcp_servers\./.test(line.trim())) {
+        // A different TOML table header (not mcp_servers) — stop skipping
+        skipping = false;
+      }
+
+      if (!skipping) {
+        result.push(line);
+      }
+    }
+
+    // Clean up excessive blank lines left behind
+    return result.join('\n').replace(/\n{3,}/g, '\n\n');
+  }
+
+  const cleanedBefore = stripFromSection(before);
+  const cleanedAfter = stripFromSection(after);
+
+  const managedBlockText = managedBlock ? managedBlock.blockText : '';
+  return `${cleanedBefore}${managedBlockText}${cleanedAfter}`;
+}
+
 function applyManagedBlock(configText, blockText) {
-  const existing = extractManagedBlock(configText);
+  // Extract server names from the new managed block to detect duplicates
+  const newEntryMap = parseMcpEntryMapFromBlock(blockText);
+  const managedServerNames = Object.keys(newEntryMap);
+
+  // First, strip any duplicate MCP entries outside the managed block
+  const cleanedConfig = stripDuplicateMcpEntries(configText, managedServerNames);
+
+  const existing = extractManagedBlock(cleanedConfig);
 
   if (!existing) {
-    if (!configText.trim()) {
+    if (!cleanedConfig.trim()) {
       return blockText;
     }
 
-    const separator = configText.endsWith('\n') ? '\n' : '\n\n';
-    return `${configText}${separator}${blockText}`;
+    const separator = cleanedConfig.endsWith('\n') ? '\n' : '\n\n';
+    return `${cleanedConfig}${separator}${blockText}`;
   }
 
-  return `${configText.slice(0, existing.start)}${blockText}${configText.slice(existing.end)}`;
+  return `${cleanedConfig.slice(0, existing.start)}${blockText}${cleanedConfig.slice(existing.end)}`;
 }
 
 function collectServersFromFile({
@@ -1037,7 +1095,9 @@ module.exports = {
   MANAGED_BLOCK_END,
   applyManagedBlock,
   buildManagedMcpBlock,
+  extractManagedBlock,
   parseMcpEntryMapFromBlock,
+  stripDuplicateMcpEntries,
   syncSkills,
   syncSources
 };
