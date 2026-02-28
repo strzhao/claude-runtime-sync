@@ -24,10 +24,11 @@ const CODEX_EVENT_MAP = {
   exec_approval_request: ['PermissionRequest'],
   apply_patch_approval_request: ['PermissionRequest'],
   request_user_input: ['PermissionRequest'],
-  agent_message: ['Stop'],
   task_started: ['TaskStarted'],
   session_configured: ['TaskStarted'],
-  task_complete: ['TaskComplete'],
+  // Codex may emit many agent_message events within a single task.
+  // Map Stop to task_complete so Claude-style Stop hooks run once per task.
+  task_complete: ['TaskComplete', 'Stop'],
   error: ['ToolError'],
   warning: ['ToolError'],
   turn_aborted: ['ToolError'],
